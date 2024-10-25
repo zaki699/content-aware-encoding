@@ -6,8 +6,8 @@
  * based on the CPU's capabilities at runtime. It ensures optimal performance across diverse hardware
  * platforms while maintaining robustness through comprehensive error handling.
  *
- * Author: Your Name
- * Date: YYYY-MM-DD
+ * Author: Zaki Ahmed
+ * Date: 2024-05-14
  */
 
 #include <libavutil/frame.h>       // For AVFrame
