@@ -114,15 +114,7 @@ static int attach_crf_metadata(AVFrame *frame, int crf) {
     return 0;
 }
 
-/**
- * @brief Predict CRF based on metrics window and attach it to the frame's metadata.
- *
- * @param ctx The CAE context.
- * @param metrics_window Pointer to the metrics window.
- * @param window_size Size of the metrics window.
- * @param frame_num The actual frame number being processed.
- * @param frame The AVFrame being processed.
- */
+
 /**
  * @brief Predict CRF based on metrics window and attach it to the frame's metadata.
  *
@@ -246,42 +238,6 @@ static int init_cae_context(CaeContext *ctx) {
     return 0;
 }
 
-/*
-static void adjust_vbv_parameters(CaeContext *ctx, double average_complexity) {
-    // Define VBV parameters mapping based on complexity
-    // You might define more granular levels or use a mathematical formula
-
-    // Implement a mapping function or use linear interpolation
-    // For example, linearly interpolate between min and max VBV settings
-    int min_vbv_maxrate = 2000000;   // 2 Mbps
-    int max_vbv_maxrate = 8000000;   // 8 Mbps
-    int min_vbv_bufsize = 4000000;   // 4 Mbps
-    int max_vbv_bufsize = 16000000;  // 16 Mbps
-
-    // Compute desired VBV parameters
-    int desired_vbv_maxrate = min_vbv_maxrate + (int)((max_vbv_maxrate - min_vbv_maxrate) * average_complexity);
-    int desired_vbv_bufsize = min_vbv_bufsize + (int)((max_vbv_bufsize - min_vbv_bufsize) * average_complexity);
-
-    // Apply smoothing to prevent abrupt changes
-    ctx->smoothed_vbv_maxrate = (ctx->lambda * desired_vbv_maxrate) + ((1.0 - ctx->lambda) * ctx->smoothed_vbv_maxrate);
-    ctx->smoothed_vbv_bufsize = (ctx->lambda * desired_vbv_bufsize) + ((1.0 - ctx->lambda) * ctx->smoothed_vbv_bufsize);
-
-    // Implement cooldown
-    if (ctx->vbv_adjust_cooldown > 0) {
-        ctx->vbv_adjust_cooldown--;
-        return;
-    }
-
-    // Only adjust if there's a significant change (e.g., more than 10%)
-    if (fabs(ctx->vbv_maxrate - ctx->smoothed_vbv_maxrate) / ctx->vbv_maxrate > 0.1 ||
-        fabs(ctx->vbv_bufsize - ctx->smoothed_vbv_bufsize) / ctx->vbv_bufsize > 0.1) {
-        ctx->vbv_maxrate = (int)ctx->smoothed_vbv_maxrate;
-        ctx->vbv_bufsize = (int)ctx->smoothed_vbv_bufsize;
-        ctx->vbv_adjust_cooldown = ctx->vbv_cooldown_duration;
-
-        av_log(NULL, AV_LOG_INFO, "Adjusted VBV parameters: Maxrate=%d, Bufsize=%d\n", ctx->vbv_maxrate, ctx->vbv_bufsize);
-    }
-}*/
 
 /**
  * @brief Uninitialize the CAE context by freeing allocated resources.
