@@ -29,12 +29,22 @@
 #include <libavutil/mem.h>
 #include <pthread.h> // For POSIX threads and mutex
 #include <omp.h>      // For OpenMP
-
+#include <time.h>
 #include <fftw3.h>    // For DCT computations
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
+
+#define START_TIMER(name) \
+    struct timespec start_##name, end_##name; \
+    clock_gettime(CLOCK_MONOTONIC, &start_##name);
+
+#define END_TIMER(name, description) \
+    clock_gettime(CLOCK_MONOTONIC, &end_##name); \
+    double elapsed_##name = (end_##name.tv_sec - start_##name.tv_sec) * 1e3 + \
+                            (end_##name.tv_nsec - start_##name.tv_nsec) / 1e6; \
+    av_log(ctx, AV_LOG_DEBUG, "%s: %.3f ms\n", description, elapsed_##name);
 
 #define BLOCK_SIZE 16 // BLOCK SIZE
 
@@ -134,6 +144,18 @@ static int compare_doubles(const void *a, const void *b);
 static int cae_config_props(AVFilterLink *inlink);
 static void adjust_weights(CaeContext *s, double delta_complexity, double delta_ssim, double delta_hist, double delta_dct, double delta_sobel, double delta_entropy, double delta_color_var);
 static bool calculate_adaptive_threshold(CaeContext *s);
+static bool is_finite_double(double value);
+
+
+/**
+ * @brief Validate if a double value is finite (not NaN or Inf).
+ *
+ * @param value The value to validate.
+ * @return true if finite, false otherwise.
+ */
+static bool is_finite_double(double value) {
+    return !isnan(value) && !isinf(value);
+}
 
 /**
  * @brief Comparator for qsort (ascending order)
@@ -327,91 +349,86 @@ static double compute_SSIM(const uint8_t *prev, const uint8_t *curr, int width, 
 }
 
 /**
- * @brief Function to compute SSIM using NEON intrinsics (Partial Optimization)
+ * @brief Optimized and Multi-Threaded SSIM Computation Using NEON Intrinsics
+ * 
+ * @param prev_data Pointer to the previous grayscale frame data
+ * @param curr_data Pointer to the current grayscale frame data
+ * @param width Width of the frame
+ * @param height Height of the frame
+ * @param stride Stride of the frame data
+ * @return double SSIM value
  */
-static double compute_SSIM_NEON(const uint8_t *prev, const uint8_t *curr, int width, int height, int stride) {
+static double compute_SSIM_NEON(const uint8_t *prev_data, const uint8_t *curr_data, int width, int height, int stride) {
 #ifdef __ARM_NEON
-    const float C1 = 6.5025f, C2 = 58.5225f;
-    const float pixel_count_inv = 1.0f / (width * height);
+    double ssim_total = 0.0;
 
-    float mean_prev = 0.0f, mean_curr = 0.0f;
-    float variance_prev = 0.0f, variance_curr = 0.0f, covariance = 0.0f;
+    // Define window size (e.g., 8x8)
+    const int window_size = 8;
+    const int num_windows_x = width / window_size;
+    const int num_windows_y = height / window_size;
 
-    // First pass: Calculate means
-    for (int y = 0; y < height; y++) {
-        const uint8_t *prev_row = prev + y * stride;
-        const uint8_t *curr_row = curr + y * stride;
+    #pragma omp parallel for reduction(+:ssim_total) schedule(dynamic)
+    for (int y = 0; y < num_windows_y; y++) {
+        for (int x = 0; x < num_windows_x; x++) {
+            const uint8_t *prev_window = prev_data + y * window_size * stride + x * window_size;
+            const uint8_t *curr_window = curr_data + y * window_size * stride + x * window_size;
 
-        // Prefetch rows to improve cache performance
-        __builtin_prefetch(prev_row, 0, 3);
-        __builtin_prefetch(curr_row, 0, 3);
+            uint8x8_t prev_vec = vld1_u8(prev_window);
+            uint8x8_t curr_vec = vld1_u8(curr_window);
 
-        int x = 0;
-        for (; x <= width - 16; x += 16) {
-            uint8x16_t p_vals = vld1q_u8(prev_row + x);
-            uint8x16_t c_vals = vld1q_u8(curr_row + x);
+            uint16x8_t prev_extended = vmovl_u8(prev_vec);
+            uint16x8_t curr_extended = vmovl_u8(curr_vec);
 
-            uint16x8_t p_low = vmovl_u8(vget_low_u8(p_vals));
-            uint16x8_t p_high = vmovl_u8(vget_high_u8(p_vals));
-            uint16x8_t c_low = vmovl_u8(vget_low_u8(c_vals));
-            uint16x8_t c_high = vmovl_u8(vget_high_u8(c_vals));
+            // Sum using vaddvq_u16 for the full vector
+            double mean_prev = (double)vaddvq_u16(prev_extended) / (window_size * window_size);
+            double mean_curr = (double)vaddvq_u16(curr_extended) / (window_size * window_size);
 
-            mean_prev += vaddvq_u32(vpaddlq_u16(p_low)) + vaddvq_u32(vpaddlq_u16(p_high));
-            mean_curr += vaddvq_u32(vpaddlq_u16(c_low)) + vaddvq_u32(vpaddlq_u16(c_high));
-        }
+            double variance_prev = 0.0, variance_curr = 0.0, covariance = 0.0;
 
-        for (; x < width; x++) {
-            mean_prev += prev_row[x];
-            mean_curr += curr_row[x];
-        }
-    }
+            for (int i = 0; i < window_size * window_size; i += 8) {
+                uint8x8_t p = vld1_u8(prev_window + i);
+                uint8x8_t c = vld1_u8(curr_window + i);
 
-    mean_prev *= pixel_count_inv;
-    mean_curr *= pixel_count_inv;
+                uint16x8_t p16 = vmovl_u8(p);
+                uint16x8_t c16 = vmovl_u8(c);
 
-    // Second pass: Calculate variances and covariance
-    for (int y = 0; y < height; y++) {
-        const uint8_t *prev_row = prev + y * stride;
-        const uint8_t *curr_row = curr + y * stride;
+                float32x4_t p_f_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(p16)));
+                float32x4_t p_f_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(p16)));
+                float32x4_t c_f_low = vcvtq_f32_u32(vmovl_u16(vget_low_u16(c16)));
+                float32x4_t c_f_high = vcvtq_f32_u32(vmovl_u16(vget_high_u16(c16)));
 
-        // Prefetch rows to improve cache performance
-        __builtin_prefetch(prev_row, 0, 3);
-        __builtin_prefetch(curr_row, 0, 3);
+                float32x4_t diff_p_low = vsubq_f32(p_f_low, vdupq_n_f32((float)mean_prev));
+                float32x4_t diff_p_high = vsubq_f32(p_f_high, vdupq_n_f32((float)mean_prev));
+                float32x4_t diff_c_low = vsubq_f32(c_f_low, vdupq_n_f32((float)mean_curr));
+                float32x4_t diff_c_high = vsubq_f32(c_f_high, vdupq_n_f32((float)mean_curr));
 
-        int x = 0;
-        for (; x <= width - 16; x += 16) {
-            uint8x16_t p_vals = vld1q_u8(prev_row + x);
-            uint8x16_t c_vals = vld1q_u8(curr_row + x);
+                float32x4_t var_p_low = vmulq_f32(diff_p_low, diff_p_low);
+                float32x4_t var_p_high = vmulq_f32(diff_p_high, diff_p_high);
+                float32x4_t var_c_low = vmulq_f32(diff_c_low, diff_c_low);
+                float32x4_t var_c_high = vmulq_f32(diff_c_high, diff_c_high);
 
-            float32x4_t dp_low = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u8(p_vals))), vdupq_n_f32(mean_prev));
-            float32x4_t dp_high = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u8(p_vals))), vdupq_n_f32(mean_prev));
-            float32x4_t dc_low = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u8(c_vals))), vdupq_n_f32(mean_curr));
-            float32x4_t dc_high = vsubq_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u8(c_vals))), vdupq_n_f32(mean_curr));
+                float32x4_t cov_low = vmulq_f32(diff_p_low, diff_c_low);
+                float32x4_t cov_high = vmulq_f32(diff_p_high, diff_c_high);
 
-            variance_prev += vaddvq_f32(vmulq_f32(dp_low, dp_low)) + vaddvq_f32(vmulq_f32(dp_high, dp_high));
-            variance_curr += vaddvq_f32(vmulq_f32(dc_low, dc_low)) + vaddvq_f32(vmulq_f32(dc_high, dc_high));
-            covariance += vaddvq_f32(vmulq_f32(dp_low, dc_low)) + vaddvq_f32(vmulq_f32(dp_high, dc_high));
-        }
+                variance_prev += (double)(vaddvq_f32(var_p_low) + vaddvq_f32(var_p_high));
+                variance_curr += (double)(vaddvq_f32(var_c_low) + vaddvq_f32(var_c_high));
+                covariance += (double)(vaddvq_f32(cov_low) + vaddvq_f32(cov_high));
+            }
 
-        for (; x < width; x++) {
-            float dp = (float)prev_row[x] - mean_prev;
-            float dc = (float)curr_row[x] - mean_curr;
-            variance_prev += dp * dp;
-            variance_curr += dc * dc;
-            covariance += dp * dc;
+            variance_prev /= (window_size * window_size - 1);
+            variance_curr /= (window_size * window_size - 1);
+            covariance /= (window_size * window_size - 1);
+
+            double C1 = 6.5025, C2 = 58.5225;
+            double ssim_window = ((2 * mean_prev * mean_curr + C1) * (2 * covariance + C2)) /
+                                  ((mean_prev * mean_prev + mean_curr * mean_curr + C1) * (variance_prev + variance_curr + C2));
+            ssim_total += ssim_window;
         }
     }
 
-    variance_prev *= pixel_count_inv;
-    variance_curr *= pixel_count_inv;
-    covariance *= pixel_count_inv;
-
-    float numerator = (2 * mean_prev * mean_curr + C1) * (2 * covariance + C2);
-    float denominator = (mean_prev * mean_prev + mean_curr * mean_curr + C1) * (variance_prev + variance_curr + C2);
-
-    return (double)(numerator / denominator);
+    return ssim_total / (num_windows_x * num_windows_y);
 #else
-    return compute_SSIM(prev, curr, width, height, stride);
+    return compute_SSIM(prev_data, curr_data, width, height, stride);
 #endif
 }
 
@@ -504,71 +521,82 @@ static double compute_DCT_energy(CaeContext *s, const uint8_t *data, int width, 
     return energy;
 }
 
+
 /**
- * @brief Compute Sobel Energy in blocks using NEON
+ * @brief Optimized Sobel Filter Using NEON Intrinsics and OpenMP
  * 
- * @param data Pointer to the input image data
- * @param width Width of the image
+ * This function computes the total Sobel energy (sum of gradient magnitudes) 
+ * for a given grayscale image using NEON vectorization and multi-threading.
+ * 
+ * @param src Pointer to the input grayscale image data
+ * @param width Width of the image (must be a multiple of 8 for optimal performance)
  * @param height Height of the image
- * @param stride Stride of the image (number of bytes per row)
- * @return double The total Sobel energy for the entire image
+ * @param stride Stride (bytes per row) of the input image
+ * @return double Total Sobel energy for the frame
  */
-static double compute_Sobel_energy_NEON(const uint8_t *data, int width, int height, int stride) {
+double compute_Sobel_energy_NEON(const uint8_t *src, int width, int height, int stride) {
 #ifdef __ARM_NEON
+    if (width < 3 || height < 3) return 0.0;
+
+    int aligned_width = (width - 2) & ~7;
     double total_sobel_energy = 0.0;
 
-    // Define Sobel kernels for x and y directions
-    int8x8_t sobel_x = { -1, 0, 1, -2, 0, 2, -1, 0, 1 };
-    int8x8_t sobel_y = { -1, -2, -1, 0, 0, 0, 1, 2, 1 };
+    // Define constants for Sobel
+    const int8x8_t neg2 = vdup_n_s8(-2);
+    const int8x8_t pos2 = vdup_n_s8(2);
+    const int8x8_t neg1 = vdup_n_s8(-1);
+    const int8x8_t pos1 = vdup_n_s8(1);
 
-    // Process image in BLOCK_SIZE x BLOCK_SIZE blocks
-    for (int y = 1; y < height - 1; y += BLOCK_SIZE) {
-        for (int x = 1; x < width - 1; x += BLOCK_SIZE) {
-            float block_sobel_energy = 0.0f;
+    #pragma omp parallel for reduction(+:total_sobel_energy) schedule(static)
+    for (int y = 1; y < height - 1; y++) {
+        const uint8_t *prev_row = src + (y - 1) * stride;
+        const uint8_t *curr_row = src + y * stride;
+        const uint8_t *next_row = src + (y + 1) * stride;
 
-            for (int by = 0; by < BLOCK_SIZE && (y + by) < height - 1; by++) {
-                const uint8_t *row = data + (y + by) * stride + x;
+        for (int x = 1; x <= aligned_width; x += 8) {
+            // Initialize gx and gy vectors
+            int16x8_t gx = vdupq_n_s16(0);
+            int16x8_t gy = vdupq_n_s16(0);
 
-                // Prefetch next row to cache
-                __builtin_prefetch(row + stride, 0, 1);
+            // Load 8 bytes from each row
+            int8x8_t prev_left = vreinterpret_s8_u8(vld1_u8(prev_row + x - 1));
+            int8x8_t prev_right = vreinterpret_s8_u8(vld1_u8(prev_row + x + 1));
+            int8x8_t curr_left = vreinterpret_s8_u8(vld1_u8(curr_row + x - 1));
+            int8x8_t curr_right = vreinterpret_s8_u8(vld1_u8(curr_row + x + 1));
+            int8x8_t next_left = vreinterpret_s8_u8(vld1_u8(next_row + x - 1));
+            int8x8_t next_right = vreinterpret_s8_u8(vld1_u8(next_row + x + 1));
 
-                for (int bx = 0; bx < BLOCK_SIZE && (x + bx) < width - 1; bx += 8) {
-                    // Load three rows around the target pixel for Sobel calculation
-                    const uint8_t *top = row + bx - stride;
-                    const uint8_t *mid = row + bx;
-                    const uint8_t *bottom = row + bx + stride;
+            // Calculate gx
+            gx = vmlal_s8(gx, prev_left, neg1);
+            gx = vmlal_s8(gx, curr_left, neg2);
+            gx = vmlal_s8(gx, next_left, neg1);
+            gx = vmlal_s8(gx, prev_right, pos1);
+            gx = vmlal_s8(gx, curr_right, pos2);
+            gx = vmlal_s8(gx, next_right, pos1);
 
-                    uint8x8_t t = vld1_u8(top);
-                    uint8x8_t m = vld1_u8(mid);
-                    uint8x8_t b = vld1_u8(bottom);
+            // Calculate gy
+            int8x8_t prev_center = vreinterpret_s8_u8(vld1_u8(prev_row + x));
+            int8x8_t next_center = vreinterpret_s8_u8(vld1_u8(next_row + x));
 
-                    // Calculate gradients in x and y directions
-                    int16x8_t gx = vmlal_s8(vmlal_s8(vdupq_n_s16(0), vreinterpret_s8_u8(vsub_u8(vext_u8(t, t, 1), vext_u8(t, t, 2))), sobel_x),
-                                            vreinterpret_s8_u8(vsub_u8(vext_u8(m, m, 1), vext_u8(m, m, 2))), sobel_x);
-                    gx = vmlal_s8(gx, vreinterpret_s8_u8(vsub_u8(vext_u8(b, b, 1), vext_u8(b, b, 2))), sobel_x);
+            gy = vmlal_s8(gy, prev_left, pos1);
+            gy = vmlal_s8(gy, prev_center, pos2);
+            gy = vmlal_s8(gy, prev_right, pos1);
+            gy = vmlal_s8(gy, next_left, neg1);
+            gy = vmlal_s8(gy, next_center, neg2);
+            gy = vmlal_s8(gy, next_right, neg1);
 
-                    int16x8_t gy = vmlal_s8(vmlal_s8(vdupq_n_s16(0), vreinterpret_s8_u8(vsub_u8(vext_u8(t, b, 1), vext_u8(b, b, 2))), sobel_y),
-                                            vreinterpret_s8_u8(vsub_u8(vext_u8(t, t, 1), vext_u8(t, t, 2))), sobel_y);
-                    gy = vmlal_s8(gy, vreinterpret_s8_u8(vsub_u8(vext_u8(b, b, 1), vext_u8(b, b, 2))), sobel_y);
+            // Sum of absolute values of gx and gy
+            uint16x8_t abs_gx = vqabsq_s16(gx);
+            uint16x8_t abs_gy = vqabsq_s16(gy);
 
-                    // Calculate magnitude of gradients
-                    int32x4_t mag_low = vaddl_s16(vget_low_s16(gx), vget_low_s16(gy));
-                    int32x4_t mag_high = vaddl_s16(vget_high_s16(gx), vget_high_s16(gy));
-
-                    // Sum up the results to calculate block energy
-                    block_sobel_energy += vaddvq_f32(vcvtq_f32_s32(mag_low)) + vaddvq_f32(vcvtq_f32_s32(mag_high));
-
-                    // Prefetch next set of data for the bottom row
-                    __builtin_prefetch(bottom + bx + stride, 0, 1);
-                }
-            }
-            total_sobel_energy += block_sobel_energy;
+            uint16x8_t sum_gx_gy = vaddq_u16(abs_gx, abs_gy);
+            total_sobel_energy += vaddvq_u16(sum_gx_gy);
         }
     }
-    return total_sobel_energy;
+
+    return total_sobel_energy / (aligned_width * (height - 2));
 #else
-    // Fallback to scalar Sobel if NEON is not available
-    return compute_sobel_energy(data, width, height, stride);
+    return compute_Sobel_energy(src, width, height, stride);
 #endif
 }
 
@@ -631,82 +659,85 @@ static double compute_entropy(const uint8_t *data, int width, int height, int st
 }
 
 /**
- * @brief Compute entropy in BLOCK_SIZE x BLOCK_SIZE blocks using NEON
- *
- * @param data Pointer to the input image data
+ * @brief Optimized Entropy Computation Using NEON Intrinsics and OpenMP
+ * 
+ * This function computes the entropy of a grayscale image using NEON vectorization and OpenMP parallelization.
+ * 
+ * @param data Pointer to the input grayscale image data
  * @param width Width of the image
  * @param height Height of the image
- * @param stride Stride of the image (number of bytes per row)
- * @return double The total entropy for the entire image
+ * @param stride Stride (bytes per row) of the input image
+ * @return double Entropy of the image
  */
 static double compute_entropy_NEON(const uint8_t *data, int width, int height, int stride) {
 #ifdef __ARM_NEON
-    double total_entropy = 0.0;
+    // Initialize a histogram array
+    uint32_t histogram[256] = {0};
+    double entropy = 0.0;
 
-    // Iterate over the image in BLOCK_SIZE x BLOCK_SIZE blocks
-    for (int y = 0; y < height; y += BLOCK_SIZE) {
-        for (int x = 0; x < width; x += BLOCK_SIZE) {
-            int hist[256] = {0}; // Initialize histogram for the block
+    // Parallelize the loop over blocks using OpenMP
+    #pragma omp parallel
+    {
+        // Each thread maintains its own local histogram to avoid race conditions
+        uint32_t local_histogram[256] = {0};
 
-            // Process each row within the block
-            for (int by = 0; by < BLOCK_SIZE && (y + by) < height; by++) {
-                const uint8_t *row = data + (y + by) * stride + x;
-                int bx = 0;
+        #pragma omp for nowait schedule(static)
+        for (int y = 0; y < height; y += BLOCK_SIZE) {
+            for (int x = 0; x < width; x += BLOCK_SIZE) {
 
-                // Prefetch the row data to improve cache performance
-                __builtin_prefetch(row, 0, 3);
+                // Iterate through each row in the block
+                for (int by = 0; by < BLOCK_SIZE && (y + by) < height; by++) {
+                    const uint8_t *row = data + (y + by) * stride + x;
 
-                // Process 16 pixels at a time using NEON
-                for (; bx <= BLOCK_SIZE - 16 && (x + bx) < width; bx += 16) {
-                    uint8x16_t pixels = vld1q_u8(row + bx);
+                    // Prefetch row data to improve cache performance
+                    __builtin_prefetch(row, 0, 3);
 
-                    // Increment histogram values for each pixel by manually unrolling
-                    hist[vgetq_lane_u8(pixels, 0)]++;
-                    hist[vgetq_lane_u8(pixels, 1)]++;
-                    hist[vgetq_lane_u8(pixels, 2)]++;
-                    hist[vgetq_lane_u8(pixels, 3)]++;
-                    hist[vgetq_lane_u8(pixels, 4)]++;
-                    hist[vgetq_lane_u8(pixels, 5)]++;
-                    hist[vgetq_lane_u8(pixels, 6)]++;
-                    hist[vgetq_lane_u8(pixels, 7)]++;
-                    hist[vgetq_lane_u8(pixels, 8)]++;
-                    hist[vgetq_lane_u8(pixels, 9)]++;
-                    hist[vgetq_lane_u8(pixels, 10)]++;
-                    hist[vgetq_lane_u8(pixels, 11)]++;
-                    hist[vgetq_lane_u8(pixels, 12)]++;
-                    hist[vgetq_lane_u8(pixels, 13)]++;
-                    hist[vgetq_lane_u8(pixels, 14)]++;
-                    hist[vgetq_lane_u8(pixels, 15)]++;
-                }
+                    int bx = 0;
 
-                // Process remaining pixels in the row
-                for (; bx < BLOCK_SIZE && (x + bx) < width; bx++) {
-                    hist[row[bx]]++;
-                }
-            }
+                    // Process 8 pixels at a time
+                    for (; bx <= BLOCK_SIZE - 8 && (x + bx + 7) < width; bx += 8) {
+                        // Load 8 pixels
+                        uint8x8_t pixels = vld1_u8(row + bx);
 
-            // Calculate entropy for the current block
-            double block_entropy = 0.0;
-            int pixel_count = BLOCK_SIZE * BLOCK_SIZE;
+                        // Increment histogram bins using NEON
+                        uint8x8_t one = vdup_n_u8(1);
+                        uint16x8_t hist = vmovl_u8(pixels); // Zero-extend to 16 bits
+                        // Note: NEON does not support direct histogram increment; scalar loop is more efficient here
+                        for (int i = 0; i < 8; i++) {
+                            local_histogram[pixels[i]]++;
+                        }
+                    }
 
-            // Avoid division by zero in case block area is smaller
-            if (pixel_count > 0) {
-                for (int i = 0; i < 256; i++) {
-                    if (hist[i] > 0) {
-                        double probability = (double)hist[i] / pixel_count;
-                        block_entropy -= probability * log2(probability);
+                    // Handle any remaining pixels
+                    for (; bx < BLOCK_SIZE && (x + bx) < width; bx++) {
+                        uint8_t pixel = row[bx];
+                        local_histogram[pixel]++;
                     }
                 }
             }
+        }
 
-            total_entropy += block_entropy;
+        // Combine local histograms into the global histogram
+        #pragma omp critical
+        {
+            for (int i = 0; i < 256; i++) {
+                histogram[i] += local_histogram[i];
+            }
+        }
+    } // End of parallel region
+
+    // Compute entropy from the global histogram
+    for (int i = 0; i < 256; i++) {
+        if (histogram[i] > 0) {
+            double p = (double)histogram[i] / (double)(width * height);
+            entropy -= p * log2(p);
         }
     }
 
-    return total_entropy;
+    return entropy;
 #else
     return compute_entropy(data, width, height, stride);
-#endif 
+#endif
 }
 
 /**
@@ -756,6 +787,8 @@ static double compute_color_variance_NEON(const uint8_t *data, int width, int he
     double sum = 0.0;
     double sum_sq = 0.0;
 
+    // Parallelize the loop over blocks using OpenMP
+    #pragma omp parallel for reduction(+:sum, sum_sq) schedule(static)
     for (int y = 0; y < height; y += BLOCK_SIZE) {
         for (int x = 0; x < width; x += BLOCK_SIZE) {
 
@@ -768,28 +801,42 @@ static double compute_color_variance_NEON(const uint8_t *data, int width, int he
 
                 int bx = 0;
 
+                // Initialize NEON vectors for sum and sum of squares
                 float32x4_t v_sum = vdupq_n_f32(0.0f);
                 float32x4_t v_sum_sq = vdupq_n_f32(0.0f);
 
-                // Process 16 pixels at a time
-                for (; bx <= BLOCK_SIZE - 16 && (x + bx) < width; bx += 16) {
-                    uint8x16_t pixels = vld1q_u8(row + bx);
+                // Process 8 pixels at a time
+                for (; bx <= BLOCK_SIZE - 8 && (x + bx + 7) < width; bx += 8) {
+                    // Load 8 pixels
+                    uint8x8_t pixels = vld1_u8(row + bx);
 
-                    uint16x8_t pixels_low = vmovl_u8(vget_low_u8(pixels));
-                    uint16x8_t pixels_high = vmovl_u8(vget_high_u8(pixels));
+                    // Convert to uint16x8_t
+                    uint16x8_t pixels_16 = vmovl_u8(pixels); // Zero-extend to 16 bits
 
-                    float32x4_t p1 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(pixels_low)));
-                    float32x4_t p2 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(pixels_low)));
-                    float32x4_t p3 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(pixels_high)));
-                    float32x4_t p4 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(pixels_high)));
+                    // Split into lower and higher 4 pixels each
+                    uint16x4_t pixels_low = vget_low_u16(pixels_16);
+                    uint16x4_t pixels_high = vget_high_u16(pixels_16);
 
-                    v_sum = vaddq_f32(v_sum, vaddq_f32(vaddq_f32(p1, p2), vaddq_f32(p3, p4)));
-                    v_sum_sq = vaddq_f32(v_sum_sq, vaddq_f32(vaddq_f32(vmulq_f32(p1, p1), vmulq_f32(p2, p2)), 
-                                                           vaddq_f32(vmulq_f32(p3, p3), vmulq_f32(p4, p4))));
+                    // Convert to uint32x4_t
+                    uint32x4_t pixels_low32 = vmovl_u16(pixels_low);
+                    uint32x4_t pixels_high32 = vmovl_u16(pixels_high);
+
+                    // Convert to float32x4_t
+                    float32x4_t p1 = vcvtq_f32_u32(pixels_low32);
+                    float32x4_t p2 = vcvtq_f32_u32(pixels_high32);
+
+                    // Accumulate sum
+                    v_sum = vaddq_f32(v_sum, vaddq_f32(p1, p2));
+
+                    // Accumulate sum of squares
+                    float32x4_t p1_sq = vmulq_f32(p1, p1);
+                    float32x4_t p2_sq = vmulq_f32(p2, p2);
+                    v_sum_sq = vaddq_f32(v_sum_sq, vaddq_f32(p1_sq, p2_sq));
                 }
 
-                sum += vaddvq_f32(v_sum);
-                sum_sq += vaddvq_f32(v_sum_sq);
+                // Horizontal add to accumulate NEON vectors
+                sum += vaddvq_f32(v_sum);     // Sum all elements in v_sum
+                sum_sq += vaddvq_f32(v_sum_sq); // Sum all elements in v_sum_sq
 
                 // Handle any remaining pixels
                 for (; bx < BLOCK_SIZE && (x + bx) < width; bx++) {
@@ -801,8 +848,11 @@ static double compute_color_variance_NEON(const uint8_t *data, int width, int he
         }
     }
 
-    double mean = sum / (width * height);
-    double variance = (sum_sq / (width * height)) - (mean * mean);
+    // Compute mean and variance
+    double total_pixels = (double)(width * height);
+    double mean = sum / total_pixels;
+    double variance = (sum_sq / total_pixels) - (mean * mean);
+
     return variance;
 #else
     return compute_color_variance(data, width, height, stride);
@@ -1053,13 +1103,13 @@ static int init_cae_context(AVFilterContext *ctx) {
     s->consecutive_detected = 0;
 
     // Initialize dynamic weights
-    s->weight_complexity = 1.0;
-    s->weight_ssim = 0.8;
-    s->weight_hist = 0.7;
-    s->weight_dct = 1.2;
-    s->weight_sobel = 1.0;
-    s->weight_entropy = 0.5;
-    s->weight_color_var = 0.5;
+    s->weight_complexity = 1.0;    // Balanced importance
+    s->weight_ssim = 1.2;           // High importance due to structural similarity
+    s->weight_hist = 0.8;           // Moderate importance
+    s->weight_dct = 1.5;            // High importance for frequency domain analysis
+    s->weight_sobel = 1.0;          // Balanced for edge detection
+    s->weight_entropy = 0.6;        // Moderate importance
+    s->weight_color_var = 0.7;      // Slightly increased for color dynamics
 
     // Initialize weighted_sum_window
     s->weighted_sum_window_size = s->window_size;
@@ -1199,6 +1249,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     if (s->window_filled || s->window_index > 0) {
         compute_metrics = true;
         // Compute SAD using NEON-optimized function
+        START_TIMER(SAD_NEON);
         current_complexity = compute_SAD_NEON(
             s->prev_gray_frame->data[0],   // Previous grayscale frame data
             gray_frame->data[0],           // Current grayscale frame data
@@ -1206,15 +1257,32 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
             s->height,
             gray_frame->linesize[0]
         );
+        END_TIMER(SAD_NEON, "SAD_NEON");
     }
 
+    // Validate current_complexity
+    if (!is_finite_double(current_complexity)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for current_complexity: %f\n", current_complexity);
+        current_complexity = 0.0; // Assign a default value or handle as needed
+    }
+
+    START_TIMER(HIST_NEON);
     // Compute Histograms
     compute_histogram_NEON(s->prev_gray_frame->data[0], s->width, s->height, gray_frame->linesize[0], s->hist_prev);
     compute_histogram_NEON(gray_frame->data[0], s->width, s->height, gray_frame->linesize[0], s->hist_curr);
+    END_TIMER(HIST_NEON, "HIST_NEON");
 
+    START_TIMER(HIST_DIFF_NEON);
     // Compute Histogram Difference
     double hist_diff = compute_hist_diff(s->hist_prev, s->hist_curr);
+    END_TIMER(HIST_DIFF_NEON, "HIST_DIFF_NEON");
+    if (!is_finite_double(hist_diff)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for hist_diff: %f\n", hist_diff);
+        hist_diff = 0.0;
+    }
+    
 
+    START_TIMER(SSIM_NEON);
     // Compute SSIM
     double ssim = compute_SSIM_NEON(
         s->prev_gray_frame->data[0],
@@ -1223,8 +1291,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         s->height,
         gray_frame->linesize[0]
     );
+    END_TIMER(SSIM_NEON, "SSIM_NEON");
 
+    if (!is_finite_double(ssim)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for SSIM: %f\n", ssim);
+        ssim = 0.0;
+    }
 
+    
+
+    START_TIMER(DCT);
     // Compute DCT Energy
     double dct_energy = compute_DCT_energy(
         s,
@@ -1233,30 +1309,59 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         s->height,
         gray_frame->linesize[0]
     );
+    END_TIMER(DCT, "DCT");
 
-    // Compute Sobel Energy (Can also be optimized similarly if desired)
+    if (!is_finite_double(dct_energy)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for DCT Energy: %f\n", dct_energy);
+        dct_energy = 0.0;
+    }
+
+    
+    
+    // Compute Sobel Energy 
+    START_TIMER(SOBEL);
     double sobel_energy = compute_Sobel_energy_NEON(
         gray_frame->data[0],
         s->width,
         s->height,
         gray_frame->linesize[0]
     );
+    END_TIMER(SOBEL, "SOBEL");
+
+    if (!is_finite_double(sobel_energy)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for Sobel Energy: %f\n", sobel_energy);
+        sobel_energy = 0.0;
+    }
 
     // Compute Entropy
+    START_TIMER(ENTROPY);
     double entropy = compute_entropy_NEON(
         gray_frame->data[0],
         s->width,
         s->height,
         gray_frame->linesize[0]
     );
+    END_TIMER(ENTROPY, "ENTROPY");
+
+    if (!is_finite_double(entropy)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for Entropy: %f\n", entropy);
+        entropy = 0.0;
+    }
 
     // Compute Color Variance
+    START_TIMER(COLOR_VARIANCE);
     double color_variance = compute_color_variance_NEON(
         gray_frame->data[0],
         s->width,
         s->height,
         gray_frame->linesize[0]
     );
+    END_TIMER(COLOR_VARIANCE, "COLOR_VARIANCE");
+
+    if (!is_finite_double(color_variance)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid value for Color Variance: %f\n", color_variance);
+        color_variance = 0.0;
+    }
 
 
     // Compute delta metrics
@@ -1276,6 +1381,36 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     double norm_sobel = log(delta_sobel + 1.0);
     double norm_entropy = log(delta_entropy + 1.0);
     double norm_color_var = log(delta_color_var + 1.0);
+
+    // Validate normalized metrics
+    if (!is_finite_double(norm_complexity)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_complexity: %f\n", norm_complexity);
+        norm_complexity = 0.0;
+    }
+    if (!is_finite_double(norm_ssim)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_ssim: %f\n", norm_ssim);
+        norm_ssim = 0.0;
+    }
+    if (!is_finite_double(norm_hist)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_hist: %f\n", norm_hist);
+        norm_hist = 0.0;
+    }
+    if (!is_finite_double(norm_dct)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_dct: %f\n", norm_dct);
+        norm_dct = 0.0;
+    }
+    if (!is_finite_double(norm_sobel)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_sobel: %f\n", norm_sobel);
+        norm_sobel = 0.0;
+    }
+    if (!is_finite_double(norm_entropy)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_entropy: %f\n", norm_entropy);
+        norm_entropy = 0.0;
+    }
+    if (!is_finite_double(norm_color_var)) {
+        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_color_var: %f\n", norm_color_var);
+        norm_color_var = 0.0;
+    }
 
     // Compute weighted sum with normalized metrics
     double weighted_sum = (norm_complexity * s->weight_complexity) +
@@ -1320,6 +1455,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     // If window is filled and metrics should be computed
     if (compute_metrics && s->window_filled) {
         // Calculate median and MAD for each metric
+        START_TIMER(MAD_MEDIAN);
         if (!calculate_median(s->complexity_window, s->window_size, &median_complexity)) {
             av_log(ctx, AV_LOG_ERROR, "Failed to calculate median for complexity.\n");
             av_frame_free(&gray_frame);
@@ -1397,6 +1533,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
             return AVERROR(ENOMEM);
         }
 
+        END_TIMER(MAD_MEDIAN, "MAD_MEDIAN");
+
         // Adjust dynamic weights based on delta metrics
         adjust_weights(s, delta_complexity, delta_ssim, delta_hist, delta_dct, delta_sobel, delta_entropy, delta_color_var);
 
@@ -1411,7 +1549,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
 
         // Recalculate Adaptive Threshold if weighted_sum_window is filled
         if (s->weighted_sum_window_filled) {
+            START_TIMER(ADAPTIVE_THRESHOLD);
             bool threshold_calculated = calculate_adaptive_threshold(s);
+            END_TIMER(ADAPTIVE_THRESHOLD, "ADAPTIVE_THRESHOLD");
             if (!threshold_calculated) {
                 av_log(ctx, AV_LOG_ERROR, "Failed to calculate adaptive threshold.\n");
                 av_frame_free(&gray_frame);
@@ -1420,24 +1560,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         }
 
         // Log detailed information
-        av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Delta_C=%.2f, Delta_S=%.4f, Delta_H=%.2f, Delta_DCT=%.2f, Delta_Sobel=%.2f, Delta_E=%.2f, Delta_CV=%.2f, "
-               "Median_C=%.2f, MAD_C=%.2f, Threshold_C=%.2f, "
-               "Median_S=%.4f, MAD_S=%.4f, Threshold_S=%.2f, "
-               "Median_H=%.2f, MAD_H=%.2f, Threshold_H=%.2f, "
-               "Median_DCT=%.2f, MAD_DCT=%.2f, Threshold_DCT=%.2f, "
-               "Median_Sobel=%.2f, MAD_Sobel=%.2f, Threshold_Sobel=%.2f, "
-               "Median_E=%.2f, MAD_E=%.2f, Threshold_E=%.2f, "
-               "Median_CV=%.2f, MAD_CV=%.2f, Threshold_CV=%.2f, "
-               "Weighted_Sum=%.2f, Median_WS=%.2f, MAD_WS=%.2f, Adaptive_Threshold=%.2f\n",
-               frame->pts, delta_complexity, delta_ssim, delta_hist, delta_dct, delta_sobel, delta_entropy, delta_color_var,
-               median_complexity, mad_complexity, threshold_complexity,
-               median_ssim, mad_ssim, threshold_ssim,
-               median_hist, mad_hist, threshold_hist,
-               median_dct, mad_dct, threshold_dct,
-               median_sobel, mad_sobel, threshold_sobel,
-               median_entropy, mad_entropy, threshold_entropy,
-               median_color_var, mad_color_var, threshold_color_var,
-               weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+        av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Raw Metrics - Complexity: %.2f, SSIM: %.4f, Histogram Difference: %.2f, DCT Energy: %.2f, Sobel Energy: %.2f, Entropy: %.2f, Color Variance: %.2f\n",
+       frame->pts, delta_complexity, delta_ssim, delta_hist, delta_dct, delta_sobel, delta_entropy, delta_color_var);
+
+       av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Normalized Metrics - Complexity: %.2f, SSIM: %.2f, Histogram: %.2f, DCT: %.2f, Sobel: %.2f, Entropy: %.2f, Color Var: %.2f\n",
+       frame->pts, norm_complexity, norm_ssim, norm_hist, norm_dct, norm_sobel, norm_entropy, norm_color_var);
+
+       av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Weighted_Sum=%.2f, Median_WS=%.2f, MAD_WS=%.2f, Adaptive_Threshold=%.2f\n",
+       frame->pts, weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+
+        av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Weighted_Sum=%.2f, Median_WS=%.2f, MAD_WS=%.2f, Adaptive_Threshold=%.2f\n",
+       frame->pts, weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+
 
         // Handle cooldown period
         if (s->current_cooldown > 0) {
