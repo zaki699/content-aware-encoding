@@ -51,6 +51,9 @@
 typedef struct CaeContext {
     const AVClass *class;
 
+    int frame_counter;            // Counts the number of frames processed
+    int frame_interval;           // Interval at which frames are processed
+
     // User-configurable options
     double alpha_complexity;              // Threshold multiplier for complexity
     double alpha_ssim;                   // Threshold multiplier for SSIM
@@ -1118,7 +1121,7 @@ static int init_cae_context(AVFilterContext *ctx) {
     if (s->alpha_sobel <= 0.0)
         s->alpha_sobel = 0.5;
     if (s->window_size <= 0)
-        s->window_size = 30;
+        s->window_size = 10;
     if (s->threshold_mode < 0)
         s->threshold_mode = 0;
     if (s->cooldown_frames < 0)
@@ -1129,6 +1132,10 @@ static int init_cae_context(AVFilterContext *ctx) {
         s->k_threshold = 3.0; // Default value
     if (s->max_weight <= 0.0)
         s->max_weight = 10.0; // Prevent weight domination
+
+    if (s->frame_interval <=0)
+        s->frame_interval = 3;
+
 
     // Allocate memory for the sliding windows
     s->complexity_window = (double*)av_malloc(s->window_size * sizeof(double));
@@ -1278,6 +1285,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     CaeContext *s = ctx->priv;
 
     START_TIMER(GLOBAL);
+
+    // Increment the frame counter
+    s->frame_counter++;
+
+    // Determine if the current frame should be processed
+    if (s->frame_counter % s->frame_interval != 0) {
+        // Optionally, log that the frame is being skipped
+        av_log(ctx, AV_LOG_DEBUG, "Skipping frame %lld for scene change detection.\n", frame->pts);
+
+        // Pass the frame to the next filter without processing
+        return ff_filter_frame(ctx->outputs[0], frame);
+    }
 
     // Allocate grayscale frame for internal processing
     AVFrame *gray_frame = ff_get_video_buffer(ctx->outputs[0], s->width, s->height);
@@ -1694,6 +1713,7 @@ static const AVOption cae_options[] = {
     { "required_consecutive_changes", "Number of consecutive detections to confirm scene change", OFFSET(required_consecutive_changes), AV_OPT_TYPE_INT, {.i64 = 2}, 1, 10, FLAGS },
     { "k_threshold", "Multiplier for MAD in adaptive threshold calculation", OFFSET(k_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 3.0}, 1.0, 10.0, FLAGS },
     { "max_weight", "Maximum sum of metric weights to prevent domination", OFFSET(max_weight), AV_OPT_TYPE_DOUBLE, {.dbl = 10.0}, 1.0, 100.0, FLAGS },
+    { "frame_interval", "Number of frames between each scene change check", OFFSET(frame_interval), AV_OPT_TYPE_INT, {.i64 = 2}, 1, 1000, FLAGS },
     { NULL }
 };
 
