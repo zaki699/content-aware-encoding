@@ -48,7 +48,6 @@
 
 #define BLOCK_SIZE 16 // BLOCK SIZE
 
-
 typedef struct CaeContext {
     const AVClass *class;
 
@@ -133,7 +132,7 @@ static void compute_histogram(const uint8_t *data, int width, int height, int st
 static void compute_histogram_NEON(const uint8_t *data, int width, int height, int stride, int *hist);
 static double compute_DCT_energy(CaeContext *s, const uint8_t *data, int width, int height, int stride);
 static double compute_Sobel_energy(const uint8_t *data, int width, int height, int stride);
-static double compute_Sobel_energy_NEON(const uint8_t *data, int width, int height, int stride);
+static double compute_Sobel_energy_NEON(const uint8_t *src, int width, int height, int stride);
 static double compute_entropy(const uint8_t *data, int width, int height, int stride);
 static double compute_entropy_NEON(const uint8_t *data, int width, int height, int stride);
 static double compute_color_variance(const uint8_t *data, int width, int height, int stride);
@@ -145,7 +144,6 @@ static int cae_config_props(AVFilterLink *inlink);
 static void adjust_weights(CaeContext *s, double delta_complexity, double delta_ssim, double delta_hist, double delta_dct, double delta_sobel, double delta_entropy, double delta_color_var);
 static bool calculate_adaptive_threshold(CaeContext *s);
 static bool is_finite_double(double value);
-
 
 /**
  * @brief Validate if a double value is finite (not NaN or Inf).
@@ -163,19 +161,19 @@ static bool is_finite_double(double value) {
 static int compare_doubles(const void *a, const void *b) {
     double da = *(const double*)a;
     double db = *(const double*)b;
-    
+
     // Handle NaN cases
     if (isnan(da) && isnan(db)) return 0;
     if (isnan(da)) return 1; // NaNs are considered greater
     if (isnan(db)) return -1;
-    
+
     // Handle Infinities
     if (da == db) return 0;
     if (da == INFINITY) return 1;
     if (db == INFINITY) return -1;
     if (da == -INFINITY) return -1;
     if (db == -INFINITY) return 1;
-    
+
     // Regular comparison
     return (da < db) ? -1 : (da > db) ? 1 : 0;
 }
@@ -186,19 +184,19 @@ static int compare_doubles(const void *a, const void *b) {
 static bool calculate_median(const double *data, int size, double *median) {
     if (size <= 0 || median == NULL)
         return false;
-    
+
     double *sorted = malloc(size * sizeof(double));
     if (!sorted)
         return false; // Memory allocation failed
-    
+
     memcpy(sorted, data, size * sizeof(double));
     qsort(sorted, size, sizeof(double), compare_doubles);
-    
+
     if (size % 2 == 0)
         *median = (sorted[size / 2 - 1] + sorted[size / 2]) / 2.0;
     else
         *median = sorted[size / 2];
-    
+
     free(sorted);
     return true;
 }
@@ -209,15 +207,15 @@ static bool calculate_median(const double *data, int size, double *median) {
 static bool calculate_mad(const double *data, int size, double median, double *mad) {
     if (size <= 0 || mad == NULL)
         return false;
-    
+
     double *deviations = malloc(size * sizeof(double));
     if (!deviations)
         return false; // Memory allocation failed
-    
+
     for (int i = 0; i < size; i++) {
         deviations[i] = fabs(data[i] - median);
     }
-    
+
     bool success = calculate_median(deviations, size, mad);
     free(deviations);
     return success;
@@ -246,43 +244,49 @@ static void compute_histogram_NEON(const uint8_t *data, int width, int height, i
     memset(hist, 0, 256 * sizeof(int));
 
     int num_threads = omp_get_max_threads();
-    int private_hists[num_threads][256];
-    memset(private_hists, 0, sizeof(private_hists));
+    int **private_hists = malloc(num_threads * sizeof(int*));
+    if (!private_hists) {
+        av_log(NULL, AV_LOG_ERROR, "Failed to allocate memory for private histograms.\n");
+        compute_histogram(data, width, height, stride, hist); // Fallback to standard histogram
+        return;
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        private_hists[i] = calloc(256, sizeof(int));
+        if (!private_hists[i]) {
+            av_log(NULL, AV_LOG_ERROR, "Failed to allocate memory for private histogram %d.\n", i);
+            // Free previously allocated histograms
+            for (int j = 0; j < i; j++) {
+                free(private_hists[j]);
+            }
+            free(private_hists);
+            compute_histogram(data, width, height, stride, hist); // Fallback
+            return;
+        }
+    }
 
     #pragma omp parallel
     {
         int thread_id = omp_get_thread_num();
         int *local_hist = private_hists[thread_id];
 
-        #pragma omp for
+        #pragma omp for nowait
         for (int y = 0; y < height; y++) {
             const uint8_t *row = data + y * stride;
-
-            // Prefetch the row
-            __builtin_prefetch(row, 0, 3);
-
-            int x = 0;
-            for (; x <= width - 16; x += 16) {
-                uint8x16_t pixels = vld1q_u8(row + x);
-
-                uint8_t pixels_array[16];
-                vst1q_u8(pixels_array, pixels);
-                for (int i = 0; i < 16; i++) {
-                    local_hist[pixels_array[i]]++;
-                }
-            }
-
-            for (; x < width; x++) {
+            for (int x = 0; x < width; x++) {
                 local_hist[row[x]]++;
             }
         }
     }
 
+    // Aggregate private histograms into the shared histogram
     for (int i = 0; i < num_threads; i++) {
         for (int j = 0; j < 256; j++) {
             hist[j] += private_hists[i][j];
         }
+        free(private_hists[i]);
     }
+    free(private_hists);
 #else
     compute_histogram(data, width, height, stride, hist);
 #endif
@@ -432,7 +436,6 @@ static double compute_SSIM_NEON(const uint8_t *prev_data, const uint8_t *curr_da
 #endif
 }
 
-
 /**
  * @brief Function to compute SAD
  */
@@ -521,31 +524,32 @@ static double compute_DCT_energy(CaeContext *s, const uint8_t *data, int width, 
     return energy;
 }
 
-
 /**
  * @brief Optimized Sobel Filter Using NEON Intrinsics and OpenMP
  * 
  * This function computes the total Sobel energy (sum of gradient magnitudes) 
- * for a given grayscale image using NEON vectorization and multi-threading.
+ * for a given grayscale image using ARM NEON vectorization and OpenMP parallelization.
+ * It processes 16 pixels per iteration to maximize SIMD throughput.
  * 
- * @param src Pointer to the input grayscale image data
- * @param width Width of the image (must be a multiple of 8 for optimal performance)
- * @param height Height of the image
+ * @param src Pointer to the input grayscale image data (16-byte aligned)
+ * @param width Width of the image (must be >=3)
+ * @param height Height of the image (must be >=3)
  * @param stride Stride (bytes per row) of the input image
  * @return double Total Sobel energy for the frame
  */
-double compute_Sobel_energy_NEON(const uint8_t *src, int width, int height, int stride) {
+static double compute_Sobel_energy_NEON(const uint8_t *restrict src, int width, int height, int stride) {
 #ifdef __ARM_NEON
     if (width < 3 || height < 3) return 0.0;
 
-    int aligned_width = (width - 2) & ~7;
+    // Calculate SIMD processing width (16 pixels per iteration)
+    int simd_width = (width - 2) / 16 * 16;
     double total_sobel_energy = 0.0;
 
     // Define constants for Sobel
-    const int8x8_t neg2 = vdup_n_s8(-2);
-    const int8x8_t pos2 = vdup_n_s8(2);
-    const int8x8_t neg1 = vdup_n_s8(-1);
-    const int8x8_t pos1 = vdup_n_s8(1);
+    const int8x16_t neg2 = vdupq_n_s8(-2);
+    const int8x16_t pos2 = vdupq_n_s8(2);
+    const int8x16_t neg1 = vdupq_n_s8(-1);
+    const int8x16_t pos1 = vdupq_n_s8(1);
 
     #pragma omp parallel for reduction(+:total_sobel_energy) schedule(static)
     for (int y = 1; y < height - 1; y++) {
@@ -553,48 +557,93 @@ double compute_Sobel_energy_NEON(const uint8_t *src, int width, int height, int 
         const uint8_t *curr_row = src + y * stride;
         const uint8_t *next_row = src + (y + 1) * stride;
 
-        for (int x = 1; x <= aligned_width; x += 8) {
+        double row_sobel_energy = 0.0;
+
+        for (int x = 1; x <= simd_width; x += 16) {
+            // Load 16 pixels from each relevant position
+            uint8x16_t prev_left_u8   = vld1q_u8(prev_row + x - 1);
+            uint8x16_t prev_right_u8  = vld1q_u8(prev_row + x + 1);
+            uint8x16_t curr_left_u8   = vld1q_u8(curr_row + x - 1);
+            uint8x16_t curr_right_u8  = vld1q_u8(curr_row + x + 1);
+            uint8x16_t next_left_u8   = vld1q_u8(next_row + x - 1);
+            uint8x16_t next_right_u8  = vld1q_u8(next_row + x + 1);
+            uint8x16_t prev_center_u8 = vld1q_u8(prev_row + x);
+            uint8x16_t next_center_u8 = vld1q_u8(next_row + x);
+
+            // Reinterpret as signed integers
+            int8x16_t p_prev_left    = vreinterpretq_s8_u8(prev_left_u8);
+            int8x16_t p_prev_right   = vreinterpretq_s8_u8(prev_right_u8);
+            int8x16_t p_curr_left    = vreinterpretq_s8_u8(curr_left_u8);
+            int8x16_t p_curr_right   = vreinterpretq_s8_u8(curr_right_u8);
+            int8x16_t p_next_left    = vreinterpretq_s8_u8(next_left_u8);
+            int8x16_t p_next_right   = vreinterpretq_s8_u8(next_right_u8);
+            int8x16_t p_prev_center  = vreinterpretq_s8_u8(prev_center_u8);
+            int8x16_t p_next_center  = vreinterpretq_s8_u8(next_center_u8);
+
             // Initialize gx and gy vectors
-            int16x8_t gx = vdupq_n_s16(0);
-            int16x8_t gy = vdupq_n_s16(0);
+            int16x8_t gx_low = vmull_s8(vget_low_s8(p_prev_left), vget_low_s8(neg1));
+            gx_low = vmlal_s8(gx_low, vget_low_s8(p_curr_left), vget_low_s8(neg2));
+            gx_low = vmlal_s8(gx_low, vget_low_s8(p_next_left), vget_low_s8(neg1));
+            gx_low = vmlal_s8(gx_low, vget_low_s8(p_prev_right), vget_low_s8(pos1));
+            gx_low = vmlal_s8(gx_low, vget_low_s8(p_curr_right), vget_low_s8(pos2));
+            gx_low = vmlal_s8(gx_low, vget_low_s8(p_next_right), vget_low_s8(pos1));
 
-            // Load 8 bytes from each row
-            int8x8_t prev_left = vreinterpret_s8_u8(vld1_u8(prev_row + x - 1));
-            int8x8_t prev_right = vreinterpret_s8_u8(vld1_u8(prev_row + x + 1));
-            int8x8_t curr_left = vreinterpret_s8_u8(vld1_u8(curr_row + x - 1));
-            int8x8_t curr_right = vreinterpret_s8_u8(vld1_u8(curr_row + x + 1));
-            int8x8_t next_left = vreinterpret_s8_u8(vld1_u8(next_row + x - 1));
-            int8x8_t next_right = vreinterpret_s8_u8(vld1_u8(next_row + x + 1));
-
-            // Calculate gx
-            gx = vmlal_s8(gx, prev_left, neg1);
-            gx = vmlal_s8(gx, curr_left, neg2);
-            gx = vmlal_s8(gx, next_left, neg1);
-            gx = vmlal_s8(gx, prev_right, pos1);
-            gx = vmlal_s8(gx, curr_right, pos2);
-            gx = vmlal_s8(gx, next_right, pos1);
+            int16x8_t gx_high = vmull_s8(vget_high_s8(p_prev_left), vget_high_s8(neg1));
+            gx_high = vmlal_s8(gx_high, vget_high_s8(p_curr_left), vget_high_s8(neg2));
+            gx_high = vmlal_s8(gx_high, vget_high_s8(p_next_left), vget_high_s8(neg1));
+            gx_high = vmlal_s8(gx_high, vget_high_s8(p_prev_right), vget_high_s8(pos1));
+            gx_high = vmlal_s8(gx_high, vget_high_s8(p_curr_right), vget_high_s8(pos2));
+            gx_high = vmlal_s8(gx_high, vget_high_s8(p_next_right), vget_high_s8(pos1));
 
             // Calculate gy
-            int8x8_t prev_center = vreinterpret_s8_u8(vld1_u8(prev_row + x));
-            int8x8_t next_center = vreinterpret_s8_u8(vld1_u8(next_row + x));
+            int16x8_t gy_low = vmull_s8(vget_low_s8(p_prev_left), vget_low_s8(pos1));
+            gy_low = vmlal_s8(gy_low, vget_low_s8(p_prev_center), vdup_n_s8(2)); // p_prev_center * 2
+            gy_low = vmlal_s8(gy_low, vget_low_s8(p_prev_right), vget_low_s8(pos1));
+            gy_low = vmlal_s8(gy_low, vget_low_s8(p_next_left), vget_low_s8(neg1));
+            gy_low = vmlal_s8(gy_low, vget_low_s8(p_next_center), vdup_n_s8(-2)); // p_next_center * -2
+            gy_low = vmlal_s8(gy_low, vget_low_s8(p_next_right), vget_low_s8(neg1));
 
-            gy = vmlal_s8(gy, prev_left, pos1);
-            gy = vmlal_s8(gy, prev_center, pos2);
-            gy = vmlal_s8(gy, prev_right, pos1);
-            gy = vmlal_s8(gy, next_left, neg1);
-            gy = vmlal_s8(gy, next_center, neg2);
-            gy = vmlal_s8(gy, next_right, neg1);
+            int16x8_t gy_high = vmull_s8(vget_high_s8(p_prev_left), vget_high_s8(pos1));
+            gy_high = vmlal_s8(gy_high, vget_high_s8(p_prev_center), vdup_n_s8(2)); // p_prev_center * 2
+            gy_high = vmlal_s8(gy_high, vget_high_s8(p_prev_right), vget_high_s8(pos1));
+            gy_high = vmlal_s8(gy_high, vget_high_s8(p_next_left), vget_high_s8(neg1));
+            gy_high = vmlal_s8(gy_high, vget_high_s8(p_next_center), vdup_n_s8(-2)); // p_next_center * -2
+            gy_high = vmlal_s8(gy_high, vget_high_s8(p_next_right), vget_high_s8(neg1));
 
             // Sum of absolute values of gx and gy
-            uint16x8_t abs_gx = vqabsq_s16(gx);
-            uint16x8_t abs_gy = vqabsq_s16(gy);
+            uint16x8_t abs_gx_low = vqabsq_s16(gx_low);
+            uint16x8_t abs_gy_low = vqabsq_s16(gy_low);
+            uint16x8_t sum_gx_gy_low = vaddq_u16(abs_gx_low, abs_gy_low);
 
-            uint16x8_t sum_gx_gy = vaddq_u16(abs_gx, abs_gy);
-            total_sobel_energy += vaddvq_u16(sum_gx_gy);
+            uint16x8_t abs_gx_high = vqabsq_s16(gx_high);
+            uint16x8_t abs_gy_high = vqabsq_s16(gy_high);
+            uint16x8_t sum_gx_gy_high = vaddq_u16(abs_gx_high, abs_gy_high);
+
+            // Accumulate the sum
+            // Convert to unsigned integers and then to integers for accumulation
+            // vaddvq_u16 sums all elements in the vector
+            uint32_t sum_low = vaddvq_u16(sum_gx_gy_low);
+            uint32_t sum_high = vaddvq_u16(sum_gx_gy_high);
+            row_sobel_energy += (double)(sum_low + sum_high);
         }
+
+        // Handle any remaining pixels not processed by SIMD
+        for (int x = simd_width + 1; x < width - 1; x++) {
+            int gx = -1 * prev_row[x - 1] + 1 * prev_row[x + 1]
+                   -2 * curr_row[x - 1] + 2 * curr_row[x + 1]
+                   -1 * next_row[x - 1] + 1 * next_row[x + 1];
+            int gy = -1 * prev_row[x - 1] - 2 * prev_row[x] -1 * prev_row[x + 1]
+                   +1 * next_row[x - 1] + 2 * next_row[x] +1 * next_row[x + 1];
+            // Use |gx| + |gy| as an approximation for magnitude to avoid sqrt
+            double magnitude = fabs((double)gx) + fabs((double)gy);
+            row_sobel_energy += magnitude;
+        }
+
+        // Accumulate row_sobel_energy to total_sobel_energy
+        total_sobel_energy += row_sobel_energy;
     }
 
-    return total_sobel_energy / (aligned_width * (height - 2));
+    return total_sobel_energy / ((double)(width - 2) * (double)(height - 2));
 #else
     return compute_Sobel_energy(src, width, height, stride);
 #endif
@@ -699,12 +748,29 @@ static double compute_entropy_NEON(const uint8_t *data, int width, int height, i
                         // Load 8 pixels
                         uint8x8_t pixels = vld1_u8(row + bx);
 
-                        // Increment histogram bins using NEON
-                        uint8x8_t one = vdup_n_u8(1);
-                        uint16x8_t hist = vmovl_u8(pixels); // Zero-extend to 16 bits
-                        // Note: NEON does not support direct histogram increment; scalar loop is more efficient here
-                        for (int i = 0; i < 8; i++) {
-                            local_histogram[pixels[i]]++;
+                        // Convert to uint16x8_t
+                        uint16x8_t pixels_16 = vmovl_u8(pixels); // Zero-extend to 16 bits
+
+                        // Split into lower and higher 4 pixels each
+                        uint16x4_t pixels_low = vget_low_u16(pixels_16);
+                        uint16x4_t pixels_high = vget_high_u16(pixels_16);
+
+                        // Convert to uint32x4_t
+                        uint32x4_t pixels_low32 = vmovl_u16(pixels_low);
+                        uint32x4_t pixels_high32 = vmovl_u16(pixels_high);
+
+                        // Convert to float32x4_t
+                        float32x4_t p1 = vcvtq_f32_u32(pixels_low32);
+                        float32x4_t p2 = vcvtq_f32_u32(pixels_high32);
+
+                        // Accumulate histogram bins
+                        for (int i = 0; i < 4; i++) {
+                            uint8_t pixel = (uint8_t)p1[i];
+                            local_histogram[pixel]++;
+                        }
+                        for (int i = 0; i < 4; i++) {
+                            uint8_t pixel = (uint8_t)p2[i];
+                            local_histogram[pixel]++;
                         }
                     }
 
@@ -980,32 +1046,31 @@ static int cae_config_props(AVFilterLink *inlink) {
     s->dst_pix_fmt = AV_PIX_FMT_GRAY8;
 
     // Allocate and initialize the previous grayscale frame
-    s->prev_gray_frame = av_frame_alloc();
+    s->prev_gray_frame = ff_get_video_buffer(ctx->outputs[0], s->width, s->height);
     if (!s->prev_gray_frame) {
         av_log(ctx, AV_LOG_ERROR, "Failed to allocate AVFrame for previous grayscale data.\n");
         sws_freeContext(s->sws_ctx);
         return AVERROR(ENOMEM);
     }
 
-    // Configure the previous grayscale frame
-    s->prev_gray_frame->format = s->dst_pix_fmt;
-    s->prev_gray_frame->width  = s->width;
-    s->prev_gray_frame->height = s->height;
-
-    if (av_frame_get_buffer(s->prev_gray_frame, 32) < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to allocate buffer for previous grayscale frame.\n");
+    // Initialize previous grayscale frame to zero
+    if (sws_scale(
+            s->sws_ctx,
+            (const uint8_t * const*)s->prev_gray_frame->data,
+            s->prev_gray_frame->linesize,
+            0,
+            s->height,
+            s->prev_gray_frame->data,
+            s->prev_gray_frame->linesize) < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to initialize previous grayscale frame.\n");
         av_frame_free(&s->prev_gray_frame);
         sws_freeContext(s->sws_ctx);
-        return AVERROR(ENOMEM);
+        return AVERROR(EINVAL);
     }
-
-    av_frame_make_writable(s->prev_gray_frame);
-    memset(s->prev_gray_frame->data[0], 0, s->prev_gray_frame->linesize[0] * s->height);
 
     // Initialize FFTW multithreading
     fftw_init_threads();
     fftw_plan_with_nthreads(omp_get_max_threads()); // Set FFTW to use maximum available threads
-
 
     // Initialize FFTW plan for DCT
     s->dct_input = fftw_alloc_real(s->width * s->height);
@@ -1128,8 +1193,6 @@ static int init_cae_context(AVFilterContext *ctx) {
     memset(s->weighted_sum_window, 0, s->weighted_sum_window_size * sizeof(double));
     s->weighted_sum_window_index = 0;
     s->weighted_sum_window_filled = false;
-    s->median_weighted_sum = 0.0;
-    s->mad_weighted_sum = 0.0;
 
     return 0;
 }
@@ -1201,9 +1264,10 @@ static av_cold void uninit_filter(AVFilterContext *ctx) {
     av_log(ctx, AV_LOG_INFO, "CAE filter uninitialized successfully.\n");
 }
 
-
 /**
  * @brief Main Filter Frame Function
+ *
+ * Processes each incoming frame to detect scene changes based on various metrics.
  *
  * @param inlink The input link.
  * @param frame The input frame.
@@ -1212,6 +1276,8 @@ static av_cold void uninit_filter(AVFilterContext *ctx) {
 static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     AVFilterContext *ctx = inlink->dst;
     CaeContext *s = ctx->priv;
+
+    START_TIMER(GLOBAL);
 
     // Allocate grayscale frame for internal processing
     AVFrame *gray_frame = ff_get_video_buffer(ctx->outputs[0], s->width, s->height);
@@ -1280,7 +1346,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         av_log(ctx, AV_LOG_ERROR, "Invalid value for hist_diff: %f\n", hist_diff);
         hist_diff = 0.0;
     }
-    
 
     START_TIMER(SSIM_NEON);
     // Compute SSIM
@@ -1298,8 +1363,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         ssim = 0.0;
     }
 
-    
-
     START_TIMER(DCT);
     // Compute DCT Energy
     double dct_energy = compute_DCT_energy(
@@ -1316,8 +1379,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         dct_energy = 0.0;
     }
 
-    
-    
     // Compute Sobel Energy 
     START_TIMER(SOBEL);
     double sobel_energy = compute_Sobel_energy_NEON(
@@ -1362,7 +1423,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         av_log(ctx, AV_LOG_ERROR, "Invalid value for Color Variance: %f\n", color_variance);
         color_variance = 0.0;
     }
-
 
     // Compute delta metrics
     double delta_complexity = fabs(current_complexity - s->previous_complexity);
@@ -1559,19 +1619,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
             }
         }
 
-        // Log detailed information
+        // Log detailed information (Removed Duplicate Logging)
         av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Raw Metrics - Complexity: %.2f, SSIM: %.4f, Histogram Difference: %.2f, DCT Energy: %.2f, Sobel Energy: %.2f, Entropy: %.2f, Color Variance: %.2f\n",
-       frame->pts, delta_complexity, delta_ssim, delta_hist, delta_dct, delta_sobel, delta_entropy, delta_color_var);
+               frame->pts, delta_complexity, delta_ssim, delta_hist, delta_dct, delta_sobel, delta_entropy, delta_color_var);
 
-       av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Normalized Metrics - Complexity: %.2f, SSIM: %.2f, Histogram: %.2f, DCT: %.2f, Sobel: %.2f, Entropy: %.2f, Color Var: %.2f\n",
-       frame->pts, norm_complexity, norm_ssim, norm_hist, norm_dct, norm_sobel, norm_entropy, norm_color_var);
-
-       av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Weighted_Sum=%.2f, Median_WS=%.2f, MAD_WS=%.2f, Adaptive_Threshold=%.2f\n",
-       frame->pts, weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+        av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Normalized Metrics - Complexity: %.2f, SSIM: %.2f, Histogram: %.2f, DCT: %.2f, Sobel: %.2f, Entropy: %.2f, Color Var: %.2f\n",
+               frame->pts, norm_complexity, norm_ssim, norm_hist, norm_dct, norm_sobel, norm_entropy, norm_color_var);
 
         av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Weighted_Sum=%.2f, Median_WS=%.2f, MAD_WS=%.2f, Adaptive_Threshold=%.2f\n",
-       frame->pts, weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
-
+               frame->pts, weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
 
         // Handle cooldown period
         if (s->current_cooldown > 0) {
@@ -1611,9 +1667,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         s->prev_gray_frame = gray_frame;
         gray_frame = tmp;
 
+        END_TIMER(GLOBAL, "GLOBAL");
+
         // Pass the original frame to the next filter
         return ff_filter_frame(ctx->outputs[0], frame);
     }
+    END_TIMER(GLOBAL, "GLOBAL");
     return ff_filter_frame(ctx->outputs[0], frame);
 }
 
