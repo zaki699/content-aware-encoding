@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <string.h>
+#include <float.h>
 #include <stddef.h> // For offsetof
 #include "libavutil/internal.h"
 #include <libavutil/imgutils.h>
@@ -118,6 +119,27 @@ typedef struct CaeContext {
     // Additional structures for Histogram
     int hist_prev[256];
     int hist_curr[256];
+
+    // **Adaptive Frame Interval Variables**
+    int min_frame_interval;       // Minimum frame interval
+    int max_frame_interval;       // Maximum frame interval
+    double activity_score;        // Combined activity score based on metrics
+
+    // **New Variables for Normalization**
+    double min_complexity, max_complexity;
+    double min_ssim, max_ssim;
+    double min_hist, max_hist;
+    double min_dct, max_dct;
+    double min_sobel, max_sobel;
+    double min_entropy, max_entropy;
+    double min_color_var, max_color_var;
+
+    double crf_exponent; // Exponent for CRF scaling
+
+    double sigmoid_slope;
+    double sigmoid_midpoint;
+
+    AVFilterContext *ctx; // Reference to the filter context for logging
 } CaeContext;
 
 // Function prototypes
@@ -147,6 +169,9 @@ static int cae_config_props(AVFilterLink *inlink);
 static void adjust_weights(CaeContext *s, double delta_complexity, double delta_ssim, double delta_hist, double delta_dct, double delta_sobel, double delta_entropy, double delta_color_var);
 static bool calculate_adaptive_threshold(CaeContext *s);
 static bool is_finite_double(double value);
+static int calculate_dynamic_crf(CaeContext *s, double activity_score);
+static int attach_crf_metadata(AVFrame *frame, int crf);
+
 
 /**
  * @brief Validate if a double value is finite (not NaN or Inf).
@@ -1133,8 +1158,34 @@ static int init_cae_context(AVFilterContext *ctx) {
     if (s->max_weight <= 0.0)
         s->max_weight = 10.0; // Prevent weight domination
 
-    if (s->frame_interval <=0)
-        s->frame_interval = 3;
+    // Initialize adaptive frame interval limits
+    if (s->min_frame_interval <= 0)
+        s->min_frame_interval = 1;
+    if (s->max_frame_interval <= s->min_frame_interval)
+        s->max_frame_interval = s->min_frame_interval + 5; // Example: min + 5 = 6
+    
+    // Initialize new normalization variables
+    s->min_complexity = DBL_MAX;
+    s->max_complexity = -DBL_MAX;
+    s->min_ssim = DBL_MAX;
+    s->max_ssim = -DBL_MAX;
+    s->min_hist = DBL_MAX;
+    s->max_hist = -DBL_MAX;
+    s->min_dct = DBL_MAX;
+    s->max_dct = -DBL_MAX;
+    s->min_sobel = DBL_MAX;
+    s->max_sobel = -DBL_MAX;
+    s->min_entropy = DBL_MAX;
+    s->max_entropy = -DBL_MAX;
+    s->min_color_var = DBL_MAX;
+    s->max_color_var = -DBL_MAX;
+
+    // Initialize crf_exponent
+    if (s->crf_exponent <= 0.0)
+        s->crf_exponent = 2.0; // Default exponent value
+
+    // Store the filter context for logging
+    s->ctx = ctx;
 
 
     // Allocate memory for the sliding windows
@@ -1290,13 +1341,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     s->frame_counter++;
 
     // Determine if the current frame should be processed
-    if (s->frame_counter % s->frame_interval != 0) {
+    //if (s->frame_counter % s->frame_interval != 0) {
         // Optionally, log that the frame is being skipped
-        av_log(ctx, AV_LOG_DEBUG, "Skipping frame %lld for scene change detection.\n", frame->pts);
+    //    av_log(ctx, AV_LOG_DEBUG, "Skipping frame %lld for scene change detection.\n", frame->pts);
 
         // Pass the frame to the next filter without processing
-        return ff_filter_frame(ctx->outputs[0], frame);
-    }
+    //    return ff_filter_frame(ctx->outputs[0], frame);
+    //}
 
     // Allocate grayscale frame for internal processing
     AVFrame *gray_frame = ff_get_video_buffer(ctx->outputs[0], s->width, s->height);
@@ -1379,7 +1430,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
 
     if (!is_finite_double(ssim)) {
         av_log(ctx, AV_LOG_ERROR, "Invalid value for SSIM: %f\n", ssim);
-        ssim = 0.0;
+        ssim = 1.0; // SSIM can be 1.0 for identical frames
     }
 
     START_TIMER(DCT);
@@ -1445,60 +1496,52 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
 
     // Compute delta metrics
     double delta_complexity = fabs(current_complexity - s->previous_complexity);
-    double delta_ssim = fabs(ssim - 1.0); // SSIM ranges from 0 to 1
+    double delta_ssim = 1.0 - ssim; // SSIM ranges from 0 to 1
     double delta_hist = hist_diff;
     double delta_dct = dct_energy;       // Assuming higher DCT energy indicates more change
     double delta_sobel = sobel_energy;   // Assuming higher Sobel energy indicates more change
     double delta_entropy = entropy;      // Assuming higher entropy indicates more change
     double delta_color_var = color_variance; // Assuming higher color variance indicates more change
 
-    // Normalize metrics using logarithmic scaling
-    double norm_complexity = log(delta_complexity + 1.0);
-    double norm_ssim = log(delta_ssim + 1.0);
-    double norm_hist = log(delta_hist + 1.0);
-    double norm_dct = log(delta_dct + 1.0);
-    double norm_sobel = log(delta_sobel + 1.0);
-    double norm_entropy = log(delta_entropy + 1.0);
-    double norm_color_var = log(delta_color_var + 1.0);
+    // Update min and max values for normalization
+    s->min_complexity = fmin(s->min_complexity, delta_complexity);
+    s->max_complexity = fmax(s->max_complexity, delta_complexity);
+    s->min_ssim = fmin(s->min_ssim, delta_ssim);
+    s->max_ssim = fmax(s->max_ssim, delta_ssim);
+    s->min_hist = fmin(s->min_hist, delta_hist);
+    s->max_hist = fmax(s->max_hist, delta_hist);
+    s->min_dct = fmin(s->min_dct, delta_dct);
+    s->max_dct = fmax(s->max_dct, delta_dct);
+    s->min_sobel = fmin(s->min_sobel, delta_sobel);
+    s->max_sobel = fmax(s->max_sobel, delta_sobel);
+    s->min_entropy = fmin(s->min_entropy, delta_entropy);
+    s->max_entropy = fmax(s->max_entropy, delta_entropy);
+    s->min_color_var = fmin(s->min_color_var, delta_color_var);
+    s->max_color_var = fmax(s->max_color_var, delta_color_var);
 
-    // Validate normalized metrics
-    if (!is_finite_double(norm_complexity)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_complexity: %f\n", norm_complexity);
-        norm_complexity = 0.0;
-    }
-    if (!is_finite_double(norm_ssim)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_ssim: %f\n", norm_ssim);
-        norm_ssim = 0.0;
-    }
-    if (!is_finite_double(norm_hist)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_hist: %f\n", norm_hist);
-        norm_hist = 0.0;
-    }
-    if (!is_finite_double(norm_dct)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_dct: %f\n", norm_dct);
-        norm_dct = 0.0;
-    }
-    if (!is_finite_double(norm_sobel)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_sobel: %f\n", norm_sobel);
-        norm_sobel = 0.0;
-    }
-    if (!is_finite_double(norm_entropy)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_entropy: %f\n", norm_entropy);
-        norm_entropy = 0.0;
-    }
-    if (!is_finite_double(norm_color_var)) {
-        av_log(ctx, AV_LOG_ERROR, "Invalid normalized_color_var: %f\n", norm_color_var);
-        norm_color_var = 0.0;
-    }
+    // Normalize metrics to 0-1 scale
+    double norm_complexity = (delta_complexity - s->min_complexity) / (s->max_complexity - s->min_complexity + 1e-6);
+    double norm_ssim = (delta_ssim - s->min_ssim) / (s->max_ssim - s->min_ssim + 1e-6);
+    double norm_hist = (delta_hist - s->min_hist) / (s->max_hist - s->min_hist + 1e-6);
+    double norm_dct = (delta_dct - s->min_dct) / (s->max_dct - s->min_dct + 1e-6);
+    double norm_sobel = (delta_sobel - s->min_sobel) / (s->max_sobel - s->min_sobel + 1e-6);
+    double norm_entropy = (delta_entropy - s->min_entropy) / (s->max_entropy - s->min_entropy + 1e-6);
+    double norm_color_var = (delta_color_var - s->min_color_var) / (s->max_color_var - s->min_color_var + 1e-6);
 
-    // Compute weighted sum with normalized metrics
-    double weighted_sum = (norm_complexity * s->weight_complexity) +
-                          (norm_ssim * s->weight_ssim) +
-                          (norm_hist * s->weight_hist) +
-                          (norm_dct * s->weight_dct) +
-                          (norm_sobel * s->weight_sobel) +
-                          (norm_entropy * s->weight_entropy) +
-                          (norm_color_var * s->weight_color_var);
+    // Compute activity_score
+    double total_weight = s->weight_complexity + s->weight_ssim + s->weight_hist +
+                          s->weight_dct + s->weight_sobel + s->weight_entropy +
+                          s->weight_color_var;
+
+    double activity_score = (
+        (norm_complexity * s->weight_complexity) +
+        (norm_ssim * s->weight_ssim) +
+        (norm_hist * s->weight_hist) +
+        (norm_dct * s->weight_dct) +
+        (norm_sobel * s->weight_sobel) +
+        (norm_entropy * s->weight_entropy) +
+        (norm_color_var * s->weight_color_var)
+    ) / total_weight;
 
     // Update sliding windows with delta metrics
     s->complexity_window[s->window_index] = delta_complexity;
@@ -1512,8 +1555,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     if (s->window_index == 0)
         s->window_filled = true;
 
+
     // Update weighted_sum_window
-    s->weighted_sum_window[s->weighted_sum_window_index] = weighted_sum;
+    s->weighted_sum_window[s->weighted_sum_window_index] = activity_score;
     s->weighted_sum_window_index = (s->weighted_sum_window_index + 1) % s->weighted_sum_window_size;
     if (s->weighted_sum_window_index == 0)
         s->weighted_sum_window_filled = true;
@@ -1646,7 +1690,25 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
                frame->pts, norm_complexity, norm_ssim, norm_hist, norm_dct, norm_sobel, norm_entropy, norm_color_var);
 
         av_log(ctx, AV_LOG_DEBUG, "Frame %lld: Weighted_Sum=%.2f, Median_WS=%.2f, MAD_WS=%.2f, Adaptive_Threshold=%.2f\n",
-               frame->pts, weighted_sum, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+               frame->pts, activity_score, s->median_weighted_sum, s->mad_weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+
+
+        // Define thresholds to adjust frame_interval
+        // These thresholds can be tuned based on empirical observations
+        double high_activity_threshold = s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum;
+        double low_activity_threshold = s->median_weighted_sum - s->k_threshold * s->mad_weighted_sum;
+
+        // Adjust frame_interval based on activity_score
+        if (s->activity_score > high_activity_threshold && s->frame_interval > s->min_frame_interval) {
+            s->frame_interval--;
+            av_log(ctx, AV_LOG_DEBUG, "High activity detected. Decreasing frame_interval to %d.\n", s->frame_interval);
+        }
+        else if (s->activity_score < low_activity_threshold && s->frame_interval < s->max_frame_interval) {
+            s->frame_interval++;
+            av_log(ctx, AV_LOG_DEBUG, "Low activity detected. Increasing frame_interval to %d.\n", s->frame_interval);
+        }
+            
+        
 
         // Handle cooldown period
         if (s->current_cooldown > 0) {
@@ -1656,16 +1718,24 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         } else {
             bool detected = false;
             if (s->weighted_sum_window_filled) {
-                detected = (weighted_sum > (s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum));
+                detected = (activity_score > (s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum));
             }
 
             if (detected) {
                 s->consecutive_detected++;
 
                 if (s->consecutive_detected >= s->required_consecutive_changes) {
+
+
+                    // Calculate dynamic CRF based on activity_score
+                    int crf = calculate_dynamic_crf(s, activity_score);
+                    av_log(ctx, AV_LOG_INFO, "Dynamic CRF set to %d based on activity score: %.3f\n", crf, activity_score);
+
+                    attach_crf_metadata(frame, crf);
+
                     // Confirm scene change
                     av_log(ctx, AV_LOG_INFO, "Scene change confirmed: Frame=%lld, Weighted_Sum=%.2f > Adaptive_Threshold=%.2f\n",
-                           frame->pts, weighted_sum, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
+                           frame->pts, activity_score, s->median_weighted_sum + s->k_threshold * s->mad_weighted_sum);
 
                     // Reset consecutive detections and set cooldown
                     s->consecutive_detected = 0;
@@ -1686,6 +1756,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
         s->prev_gray_frame = gray_frame;
         gray_frame = tmp;
 
+        
         END_TIMER(GLOBAL, "GLOBAL");
 
         // Pass the original frame to the next filter
@@ -1694,6 +1765,66 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame) {
     END_TIMER(GLOBAL, "GLOBAL");
     return ff_filter_frame(ctx->outputs[0], frame);
 }
+
+
+
+/**
+ * @brief Calculate dynamic CRF based on activity score.
+ *
+ * @param s Pointer to CaeContext.
+ * @param activity_score Normalized activity score (0 to 1).
+ * @return int Calculated CRF value.
+ */
+static int calculate_dynamic_crf(CaeContext *s, double activity_score) {
+    int min_crf = 15;
+    int max_crf = 35;
+
+    // Sigmoid parameters
+    double k = s->sigmoid_slope;      // Controls the steepness of the curve
+    double x0 = s->sigmoid_midpoint;  // Midpoint of the sigmoid curve
+
+    // Sigmoid function scaling
+    double scaling_factor = 1.0 / (1.0 + exp(-k * (activity_score - x0)));
+
+    // Invert scaling factor for inverse relationship
+    scaling_factor = 1.0 - scaling_factor;
+
+    int crf = min_crf + (int)((max_crf - min_crf) * scaling_factor);
+    crf = FFMIN(FFMAX(crf, min_crf), max_crf);
+
+    av_log(s->ctx, AV_LOG_INFO, "Dynamic CRF set to %d based on activity score: %.3f\n", crf, activity_score);
+
+    return crf;
+}
+
+/**
+ * @brief Attach CRF value to the frame's metadata.
+ *
+ * @param frame The AVFrame to which the metadata will be attached.
+ * @param crf The predicted CRF value to attach.
+ * @return int 0 on success, negative AVERROR code on failure.
+ */
+static int attach_crf_metadata(AVFrame *frame, int crf) {
+
+    if (!frame)
+        return 0;
+
+
+    // Allocate new side data
+    AVFrameSideData *side_data = av_frame_new_side_data(frame, AV_FRAME_DATA_CUSTOM_CRF, sizeof(int));
+    if (!side_data) {
+        // Handle allocation failure
+        fprintf(stderr, "Failed to allocate side data for frame.\n");
+        return AVERROR(ENOMEM);
+    }
+
+    // Copy the CRF value into the side data
+    memcpy(side_data->data, &crf, sizeof(int));
+        
+    return 0;
+}
+
+
 
 /**
  * @brief Define filter options (configurable parameters).
@@ -1713,7 +1844,18 @@ static const AVOption cae_options[] = {
     { "required_consecutive_changes", "Number of consecutive detections to confirm scene change", OFFSET(required_consecutive_changes), AV_OPT_TYPE_INT, {.i64 = 2}, 1, 10, FLAGS },
     { "k_threshold", "Multiplier for MAD in adaptive threshold calculation", OFFSET(k_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 3.0}, 1.0, 10.0, FLAGS },
     { "max_weight", "Maximum sum of metric weights to prevent domination", OFFSET(max_weight), AV_OPT_TYPE_DOUBLE, {.dbl = 10.0}, 1.0, 100.0, FLAGS },
-    { "frame_interval", "Number of frames between each scene change check", OFFSET(frame_interval), AV_OPT_TYPE_INT, {.i64 = 2}, 1, 1000, FLAGS },
+    { "min_frame_interval", "Minimum frame interval for adaptive processing", OFFSET(min_frame_interval), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 1000, FLAGS },
+    { "max_frame_interval", "Maximum frame interval for adaptive processing", OFFSET(max_frame_interval), AV_OPT_TYPE_INT, {.i64 = 5}, 1, 1000, FLAGS },
+    { "weight_complexity", "Weight for complexity metric", OFFSET(weight_complexity), AV_OPT_TYPE_DOUBLE, {.dbl = 1.5}, 0, 10, FLAGS },
+    { "weight_ssim", "Weight for SSIM metric", OFFSET(weight_ssim), AV_OPT_TYPE_DOUBLE, {.dbl = 2.0}, 0, 10, FLAGS },
+    { "weight_hist", "Weight for histogram difference metric", OFFSET(weight_hist), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, 10, FLAGS },
+    { "weight_dct", "Weight for DCT energy metric", OFFSET(weight_dct), AV_OPT_TYPE_DOUBLE, {.dbl = 1.5}, 0, 10, FLAGS },
+    { "weight_sobel", "Weight for Sobel energy metric", OFFSET(weight_sobel), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0}, 0, 10, FLAGS },
+    { "weight_entropy", "Weight for entropy metric", OFFSET(weight_entropy), AV_OPT_TYPE_DOUBLE, {.dbl = 0.5}, 0, 10, FLAGS },
+    { "weight_color_var", "Weight for color variance metric", OFFSET(weight_color_var), AV_OPT_TYPE_DOUBLE, {.dbl = 0.5}, 0, 10, FLAGS },
+    { "crf_exponent", "Exponent for CRF scaling", OFFSET(crf_exponent), AV_OPT_TYPE_DOUBLE, {.dbl = 2.0}, 0.1, 5.0, FLAGS },
+    { "sigmoid_slope", "Slope of the sigmoid function", OFFSET(sigmoid_slope), AV_OPT_TYPE_DOUBLE, {.dbl = 10.0}, 0.1, 100.0, FLAGS },
+    { "sigmoid_midpoint", "Midpoint of the sigmoid function", OFFSET(sigmoid_midpoint), AV_OPT_TYPE_DOUBLE, {.dbl = 0.5}, 0.0, 1.0, FLAGS },
     { NULL }
 };
 
